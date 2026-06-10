@@ -1,2 +1,5 @@
 res://scripts/main.gd
-res://scripts/boar.gd
+res://scripts/cloud.gd
+res://scripts/tree.gd
+res://scripts/bird.gd
+res://scripts/fish.gd

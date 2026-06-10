@@ -80,7 +80,6 @@ func _process(delta: float) -> void:
 		idle_left -= delta
 		if idle_left <= 0.0 and not _start_run():
 			idle_left = randf_range(1.0, 3.0)   # boxed in; try again later
-	queue_redraw()
 
 
 func _start_idle() -> void:
@@ -107,10 +106,11 @@ func _start_run() -> bool:
 	return false
 
 
-func _draw() -> void:
+## Sprite draw data for the terrain to composite this frame (see main._draw).
+func render() -> Dictionary:
 	var tex: Texture2D = _tex.get(facing + ("_run" if running else "_idle"))
 	if tex == null:
-		return
+		return {}
 	var cols := RUN_COLS if running else IDLE_COLS
 	var rows := RUN_ROWS if running else IDLE_ROWS
 	var fw := tex.get_width() / float(cols)
@@ -129,4 +129,10 @@ func _draw() -> void:
 	# Anchor at the centre of the surface diamond of the cell underfoot.
 	var ax := (gx - gy) * HALF_W + HALF_W
 	var ay := (gx + gy) * QUARTER_H - h * STEP + QUARTER_H
-	draw_texture_rect_region(tex, Rect2(ax - fw / 2.0, ay - fh + FOOT, fw, fh), src)
+	return {
+		d = gx + gy,
+		tex = tex,
+		src = src,
+		dst = Rect2(ax - fw / 2.0, ay - fh + FOOT, fw, fh),
+		mod = Color.WHITE,
+	}

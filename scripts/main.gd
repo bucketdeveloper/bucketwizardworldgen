@@ -33,6 +33,20 @@ const MIN_RIVER_LEN := 20
 
 const BoarScript := preload("res://scripts/boar.gd")
 const StagScript := preload("res://scripts/stag.gd")
+const TreeScript := preload("res://scripts/tree.gd")
+const CloudScript := preload("res://scripts/cloud.gd")
+const FishScript := preload("res://scripts/fish.gd")
+const BirdScript := preload("res://scripts/bird.gd")
+
+# Clouds drift in from the top-right edge (grid y just above 0) and are removed
+# once they pass the bottom-left edge (grid y past MAP_H). These are the grid
+# margins, in cells, beyond the edge for spawning and despawning.
+const CLOUD_SPAWN_MARGIN := 6.0
+const CLOUD_EXIT_MARGIN := 20.0
+# A cloud bank is scattered this many cells across the entry edge and back from
+# it, so the clouds read as one large, ragged bank rather than a neat line.
+const CLOUD_BANK_SPREAD := 22.0
+const CLOUD_BANK_DEPTH := 16.0
 
 enum { GRASS, DIRT, WATER }
 
@@ -109,6 +123,26 @@ const FLOOD_CALM_T := 0.3
 @export var boar_max_count := 8
 @export var stag_min_count := 2
 @export var stag_max_count := 8
+# Bluebirds that wander the sky, landing on grass to peck before flying off.
+@export var bird_min_count := 3
+@export var bird_max_count := 6
+# Trees placed on random grass cells; each cycles through all growth stages.
+@export var tree_count := 180
+# Clouds arrive in banks: a bank of cloud_group_min..cloud_group_max clouds
+# drifts in when the map loads, then a new bank arrives every
+# cloud_spawn_min..cloud_spawn_max seconds. Clouds in a bank are offset within
+# CLOUD_BANK_SPREAD across the entry edge and CLOUD_BANK_DEPTH back from it.
+@export var cloud_group_min := 3
+@export var cloud_group_max := 11
+@export var cloud_spawn_min := 10.0
+@export var cloud_spawn_max := 60.0
+# Chance, per river cell, that a fish is left flopping when that cell dries out.
+@export_range(0.0, 1.0) var fish_chance := 0.004
+# Heavy-rain clouds raise the water level of the river tiles under them (and one
+# tile around) for this long after passing; the boost spreads through connected
+# water up to rain_boost_radius tiles before receding.
+@export var rain_boost_seconds := 10.0
+@export_range(1, 30) var rain_boost_radius := 5
 # Lakes grown out from the rivers they attach to.
 @export var lake_min_count := 1
 @export var lake_max_count := 3
@@ -130,6 +164,16 @@ var _floodtile: Array = []      # _floodtile[x][y] -> flood sprite over shore ce
 var _rocktile: Array = []       # _rocktile[x][y]  -> row-7 rock sprite on a water cell, or -1
 var _boars: Array = []          # live boar critter nodes
 var _stags: Array = []          # live stag critter nodes
+var _trees: Array = []          # live tree nodes
+var _tree_at: Dictionary = {}   # Vector2i cell -> tree node, for flood-over-tree lookup
+var _clouds: Array = []         # live cloud nodes (drawn on top of everything)
+var _next_cloud := 0.0          # seconds until the next cloud drifts in
+var _birds: Array = []          # wandering bluebird nodes
+var _fish_at: Dictionary = {}   # Vector2i cell -> flopping fish node
+var _wcells_by_dist: Dictionary = {}  # ring distance -> Array[Vector2i] of water cells
+var _dist_dry: Dictionary = {}  # ring distance -> bool (its cells are currently fully dry)
+var _rain_until: Dictionary = {}  # Vector2i source cell -> rain-boost expiry time
+var _boosted: Dictionary = {}   # Vector2i -> true, cells raised one water level this frame
 var _wdist: Array = []          # _wdist[x][y]   -> water rings from map edge (-1 if not water)
 var _max_wdist := 0             # largest _wdist value (bounds the fade window)
 var _time := 0.0                # seconds since start, drives the water cycle
@@ -164,14 +208,92 @@ func _generate() -> void:
 	queue_redraw()
 
 
-## Replaces any existing critters with fresh random herds on walkable land.
+## Replaces any existing critters and trees with fresh random ones.
 func _spawn_critters() -> void:
 	for b in _boars:
 		b.queue_free()
 	for s in _stags:
 		s.queue_free()
+	for t in _trees:
+		t.queue_free()
+	for c in _clouds:
+		c.queue_free()
+	for f in _fish_at.values():
+		f.queue_free()
+	for b in _birds:
+		b.queue_free()
+	_fish_at = {}
+	_dist_dry = {}
+	_rain_until = {}
+	_boosted = {}
 	_boars = _spawn_herd(BoarScript, randi_range(boar_min_count, boar_max_count))
 	_stags = _spawn_herd(StagScript, randi_range(stag_min_count, stag_max_count))
+	_spawn_trees(tree_count)
+	_spawn_clouds()
+	_spawn_birds()
+
+
+## Spawns the wandering bluebirds. They start aloft anywhere on the map and
+## roam, so (unlike ground critters) their start cell needn't be walkable.
+func _spawn_birds() -> void:
+	_birds = []
+	for _i in randi_range(bird_min_count, bird_max_count):
+		var b: Node2D = BirdScript.new()
+		add_child(b)
+		b.setup(self, Vector2i(randi() % MAP_W, randi() % MAP_H))
+		_birds.append(b)
+
+
+## True for plain grass a bird may land on (not dirt, water, or a stone clump).
+func is_grass(c: Vector2i) -> bool:
+	return _in_bounds(c.x, c.y) and _terrain[c.x][c.y] == GRASS and not _stone[c.x][c.y]
+
+
+## Seeds a couple of banks already spread across the sky (so clouds are visible
+## right away, not a minute's drift away) and arms the timer for the next bank.
+func _spawn_clouds() -> void:
+	_clouds = []
+	for _i in 3:
+		_add_cloud_bank(true)
+	_next_cloud = randf_range(cloud_spawn_min, cloud_spawn_max)
+
+
+## Adds a bank of cloud_group_min..cloud_group_max clouds, scattered around a
+## base spot so they read as one large, ragged bank. With over_map the bank is
+## placed somewhere across the map (used at load); otherwise it enters just off
+## the top-right edge and drifts in.
+func _add_cloud_bank(over_map := false) -> void:
+	# Load-time banks are centred on the camera's start view (the map middle) so
+	# clouds are visible immediately; later banks enter off the top-right edge.
+	var base_x := MAP_W * 0.5 if over_map else randf_range(0.0, MAP_W)
+	var base_y := MAP_H * 0.5 if over_map else -CLOUD_SPAWN_MARGIN
+	for _i in randi_range(cloud_group_min, cloud_group_max):
+		var c: Node2D = CloudScript.new()
+		add_child(c)
+		var gx := base_x + randf_range(-CLOUD_BANK_SPREAD, CLOUD_BANK_SPREAD)
+		var gy: float
+		if over_map:
+			gy = base_y + randf_range(-CLOUD_BANK_DEPTH, CLOUD_BANK_DEPTH)
+		else:
+			gy = base_y - randf_range(0.0, CLOUD_BANK_DEPTH)
+		c.setup(Vector2(gx, gy))
+		_clouds.append(c)
+
+
+## Places trees on random grass cells (not dirt, water, or stone clumps).
+func _spawn_trees(count: int) -> void:
+	_trees = []
+	_tree_at = {}
+	var tries := 0
+	while _trees.size() < count and tries < 8000:
+		tries += 1
+		var c := Vector2i(randi() % MAP_W, randi() % MAP_H)
+		if _terrain[c.x][c.y] == GRASS and not _stone[c.x][c.y] and not _tree_at.has(c):
+			var t: Node2D = TreeScript.new()
+			add_child(t)
+			t.setup(self, c)
+			_trees.append(t)
+			_tree_at[c] = t
 
 
 func _spawn_herd(script: GDScript, count: int) -> Array:
@@ -219,8 +341,24 @@ func nearest_boar(p: Vector2) -> Vector2:
 
 func _process(delta: float) -> void:
 	_time += delta
-	# Redraw every frame while any tile may be cross-fading; otherwise only when
-	# the wave advances a ring (at most 1/water_ring_seconds Hz).
+	_reap_trees()
+	_reap_clouds()
+	# A fresh cloud drifts in on its own timer, on top of the load-time batch.
+	_next_cloud -= delta
+	if _next_cloud <= 0.0:
+		_add_cloud_bank()
+		_next_cloud = randf_range(cloud_spawn_min, cloud_spawn_max)
+	_update_fish()
+	_update_rain_boost()
+	# Entities animate and move continuously, and they're composited into _draw,
+	# so the scene must redraw every frame whenever any are present.
+	if not _boars.is_empty() or not _stags.is_empty() or not _trees.is_empty() \
+			or not _clouds.is_empty() or not _fish_at.is_empty() or not _rain_until.is_empty() \
+			or not _birds.is_empty():
+		queue_redraw()
+		return
+	# Otherwise redraw every frame while any tile may be cross-fading, else only
+	# when the wave advances a ring (at most 1/water_ring_seconds Hz).
 	if _fade_active():
 		queue_redraw()
 		return
@@ -228,6 +366,74 @@ func _process(delta: float) -> void:
 	if tick != _last_tick:
 		_last_tick = tick
 		queue_redraw()
+
+
+## A tree that has lived out its life cycle (grown, held, fallen, and shown its
+## final debris frame) sets `finished`; here we free those nodes and drop them
+## from the live list so they stop being composited.
+func _reap_trees() -> void:
+	if _trees.is_empty():
+		return
+	var alive: Array = []
+	for t in _trees:
+		if t.finished:
+			_tree_at.erase(t.cell)
+			t.queue_free()
+		else:
+			alive.append(t)
+	if alive.size() != _trees.size():
+		_trees = alive
+
+
+## Frees clouds that have drifted past the bottom-left edge of the map.
+func _reap_clouds() -> void:
+	if _clouds.is_empty():
+		return
+	var alive: Array = []
+	for c in _clouds:
+		if c.pos.y > MAP_H + CLOUD_EXIT_MARGIN:
+			c.queue_free()
+		else:
+			alive.append(c)
+	if alive.size() != _clouds.size():
+		_clouds = alive
+
+
+## True once cell-distance d's water has fully faded into the dry phase (the
+## cracked-dirt riverbed is completely shown), false while wet or mid-fade.
+func _dist_fully_dry(d: int) -> bool:
+	var since := _time - d * water_ring_seconds
+	if since < 0.0:
+		return false
+	var k := floori(since / water_cycle_seconds)
+	if k < 0 or k % 3 != PHASE_DRY:
+		return false
+	if water_fade_seconds <= 0.0:
+		return true
+	return (since - k * water_cycle_seconds) / water_fade_seconds >= 1.0
+
+
+## Watches each ring-distance group of river cells: when it dries out, each cell
+## has a fish_chance of stranding a flopping fish; when it goes wet again, those
+## fish are removed. Cheap because every cell at a distance shares one phase.
+func _update_fish() -> void:
+	for d in _wcells_by_dist:
+		var dry := _dist_fully_dry(d)
+		var was: bool = _dist_dry.get(d, false)
+		if dry and not was:
+			_dist_dry[d] = true
+			for c: Vector2i in _wcells_by_dist[d]:
+				if not _fish_at.has(c) and randf() < fish_chance:
+					var f: Node2D = FishScript.new()
+					add_child(f)
+					f.setup(self, c)
+					_fish_at[c] = f
+		elif not dry and was:
+			_dist_dry[d] = false
+			for c: Vector2i in _wcells_by_dist[d]:
+				if _fish_at.has(c):
+					_fish_at[c].queue_free()
+					_fish_at.erase(c)
 
 
 ## True if some water tile could currently be mid-fade. The wave front for a
@@ -504,6 +710,19 @@ func _build_water_distance() -> void:
 					_wdist[x][y] = best + 1
 			_max_wdist = maxi(_max_wdist, _wdist[x][y])
 
+	# Group water cells by ring distance. Every cell at a given distance shares
+	# the same water phase at any moment, so the fish-on-dry-riverbed check can
+	# test one phase per distance instead of one per cell.
+	_wcells_by_dist = {}
+	for x in MAP_W:
+		for y in MAP_H:
+			if _terrain[x][y] == WATER and _wdist[x][y] >= 0:
+				var d: int = _wdist[x][y]
+				if not _wcells_by_dist.has(d):
+					_wcells_by_dist[d] = []
+				_wcells_by_dist[d].append(Vector2i(x, y))
+	_dist_dry = {}
+
 
 ## Water-power phase (HIGH/LOW/DRY) for a water or valley-shoulder tile, with
 ## fade progress.
@@ -720,6 +939,18 @@ func _deep_water(x: int, y: int) -> bool:
 func _draw() -> void:
 	if _columns.is_empty():
 		return
+	# Gather entity (tree/boar/stag) sprites, sorted by their iso diagonal so they
+	# can be interleaved with the terrain rows below. Each render() returns a dict
+	# {d, tex, src, dst, mod} (or {} for nothing to draw); d = grid x + y.
+	var ents: Array = []
+	for group in [_trees, _boars, _stags, _fish_at.values(), _birds]:
+		for e in group:
+			var info: Dictionary = e.render()
+			if not info.is_empty():
+				ents.append(info)
+	ents.sort_custom(func(a, b): return a.d < b.d)
+	var ei := 0
+
 	# Painter's order: increasing diagonal (x + y), then bottom-to-top per column.
 	for s in range(MAP_W + MAP_H - 1):
 		var x_start := maxi(0, s - (MAP_H - 1))
@@ -733,7 +964,7 @@ func _draw() -> void:
 				# Look depends on the current water-power phase. While a phase
 				# change is fresh, the old state is drawn underneath and the new
 				# state fades in on top of it.
-				var pb := _water_phase_blend(x, y)
+				var pb := _effective_phase_blend(x, y)
 				var rock: int = _rocktile[x][y]
 				# While the river runs high the surface rises above the rocks,
 				# so they are drawn first (submerged) instead of on top.
@@ -755,36 +986,137 @@ func _draw() -> void:
 				var deco: int = _decor[x][y]
 				if deco >= 0:
 					_draw_sprite(deco, base_x, base_y - (ids.size() - 1) * STEP)
-				# Flood: during the high phase the valley shoulder is covered by
-				# a dark water tile one level above its surface, cross-fading in
-				# and out as the wave passes.
-				var fl: int = _floodtile[x][y]
-				if fl >= 0:
-					var pb := _water_phase_blend(x, y)
-					var fy := base_y - float((SHORE_H + 1) * STEP)
-					if pb[1] == PHASE_HIGH:
-						var a: float = pb[2] if pb[0] != PHASE_HIGH else 1.0
-						_draw_flood(fl - WATER_DARK_OFFSET, base_x, fy, a)
-					elif pb[0] == PHASE_HIGH and pb[2] < 1.0:
-						# Water receding: the flood quickly calms to the light
-						# low-power tile, which then fades away.
-						var t: float = pb[2]
-						if t < FLOOD_CALM_T:
-							_draw_flood(fl, base_x, fy, 1.0)
-							_draw_flood(fl - WATER_DARK_OFFSET, base_x, fy, 1.0 - t / FLOOD_CALM_T)
-						else:
-							_draw_flood(fl, base_x, fy, 1.0 - (t - FLOOD_CALM_T) / (1.0 - FLOOD_CALM_T))
+				# Flood: the valley shoulder is covered by a dark water tile in the high
+				# phase. A tree's cell draws its flood AFTER the tree (see _blit_entity)
+				# so the water covers the tree base; skip it here in that case.
+				if not _tree_at.has(Vector2i(x, y)):
+					_draw_cell_flood(x, y, base_x, base_y)
+		# Draw entities standing on this diagonal (or just behind it). Tiles on
+		# later diagonals are drawn afterwards and so correctly occlude them.
+		while ei < ents.size() and ents[ei].d < s + 1.0:
+			_blit_entity(ents[ei])
+			ei += 1
+	# Any entities past the last terrain diagonal.
+	while ei < ents.size():
+		_blit_entity(ents[ei])
+		ei += 1
+
+	# Clouds float in the sky, so they draw last, on top of all terrain and
+	# entities, sorted among themselves so nearer clouds overlap farther ones.
+	var sky: Array = []
+	for cloud in _clouds:
+		var ci: Dictionary = cloud.render()
+		if not ci.is_empty():
+			sky.append(ci)
+	sky.sort_custom(func(a, b): return a.d < b.d)
+	for ci in sky:
+		_blit(ci)
+
+
+## Blits an entity, then (for trees on a flooding cell) draws that cell's flood
+## water over the tree so a tree on a freshly-wet tile looks submerged.
+func _blit_entity(info: Dictionary) -> void:
+	_blit(info)
+	if info.has("cell"):
+		var c: Vector2i = info.cell
+		_draw_cell_flood(c.x, c.y, float((c.x - c.y) * HALF_W), float((c.x + c.y) * QUARTER_H))
+
+
+## Blits one entity sprite dict {tex, src, dst, mod} produced by render().
+## An optional "label"/"label_pos" draws a small debug tag over the sprite.
+func _blit(info: Dictionary) -> void:
+	draw_texture_rect_region(info.tex, info.dst, info.src, info.mod)
+	if info.has("label"):
+		_draw_label(info.label, info.label_pos)
+
+
+## Draws a small orange box with white text, bottom-centred on anchor.
+func _draw_label(text: String, anchor: Vector2) -> void:
+	var font := ThemeDB.fallback_font
+	var fs := 8
+	var pad := Vector2(2.0, 1.0)
+	var sz := font.get_string_size(text, HORIZONTAL_ALIGNMENT_LEFT, -1, fs)
+	var box := Rect2(anchor - Vector2(sz.x * 0.5 + pad.x, sz.y + pad.y * 2.0), sz + pad * 2.0)
+	draw_rect(box, Color(1.0, 0.5, 0.0))
+	draw_string(font, Vector2(box.position.x + pad.x, box.position.y + pad.y + font.get_ascent(fs)),
+		text, HORIZONTAL_ALIGNMENT_LEFT, -1, fs, Color.WHITE)
+
+
+## Draws the valley-shoulder flood water over cell (x,y), cross-fading with the
+## wave. Does nothing if the cell has no flood tile or the wave isn't high here.
+func _draw_cell_flood(x: int, y: int, base_x: float, base_y: float) -> void:
+	var fl: int = _floodtile[x][y]
+	if fl < 0:
+		return
+	var pb := _effective_phase_blend(x, y)
+	var fy := base_y - float((SHORE_H + 1) * STEP)
+	if pb[1] == PHASE_HIGH:
+		var a: float = pb[2] if pb[0] != PHASE_HIGH else 1.0
+		_draw_flood(fl - WATER_DARK_OFFSET, base_x, fy, a)
+	elif pb[0] == PHASE_HIGH and pb[2] < 1.0:
+		var t: float = pb[2]
+		if t < FLOOD_CALM_T:
+			_draw_flood(fl, base_x, fy, 1.0)
+			_draw_flood(fl - WATER_DARK_OFFSET, base_x, fy, 1.0 - t / FLOOD_CALM_T)
+		else:
+			_draw_flood(fl, base_x, fy, 1.0 - (t - FLOOD_CALM_T) / (1.0 - FLOOD_CALM_T))
+
+
+## Boost-aware water phase: like _water_phase_blend, but tiles currently wet by a
+## heavy-rain cloud are shifted up one level (dry->low, low->high; phase numbers
+## run HIGH=0 < LOW=1 < DRY=2, so more water means a smaller number).
+func _effective_phase_blend(x: int, y: int) -> Array:
+	var pb := _water_phase_blend(x, y)
+	if _boosted.has(Vector2i(x, y)):
+		return [maxi(0, int(pb[0]) - 1), maxi(0, int(pb[1]) - 1), pb[2]]
+	return pb
+
+
+## Heavy-rain clouds wet the 3x3 of river tiles under them; each becomes a +1
+## water-level source that lingers rain_boost_seconds after the cloud passes.
+## The boost spreads through connected water up to rain_boost_radius tiles, then
+## recedes. _boosted lists every cell raised a level this frame.
+func _update_rain_boost() -> void:
+	for cloud in _clouds:
+		if not cloud.is_heavy_rain():
+			continue
+		var center := Vector2i(roundi(cloud.pos.x), roundi(cloud.pos.y))
+		for dx in range(-1, 2):
+			for dy in range(-1, 2):
+				var c := center + Vector2i(dx, dy)
+				if _in_bounds(c.x, c.y) and _terrain[c.x][c.y] == WATER:
+					_rain_until[c] = _time + rain_boost_seconds
+	for c: Vector2i in _rain_until.keys():
+		if _rain_until[c] <= _time:
+			_rain_until.erase(c)
+	# Spread outward from live sources through connected water, capped by radius.
+	_boosted = {}
+	var frontier: Array = []
+	for c: Vector2i in _rain_until:
+		_boosted[c] = true
+		frontier.append([c, 0])
+	var head := 0
+	while head < frontier.size():
+		var item: Array = frontier[head]
+		head += 1
+		var cell: Vector2i = item[0]
+		var dist: int = item[1]
+		if dist >= rain_boost_radius:
+			continue
+		for nb: Vector2i in [Vector2i(cell.x + 1, cell.y), Vector2i(cell.x - 1, cell.y), Vector2i(cell.x, cell.y + 1), Vector2i(cell.x, cell.y - 1)]:
+			if _in_bounds(nb.x, nb.y) and _terrain[nb.x][nb.y] == WATER and not _boosted.has(nb):
+				_boosted[nb] = true
+				frontier.append([nb, dist + 1])
 
 
 ## Draws a water cell in the given phase at fade alpha a. During the high phase
-## the surface rises to the flood waterline (SHORE_H + 1 levels up, matching the
-## flooded shoulder tiles); a second cube is kept at the base level so no gap
-## opens beneath the raised surface.
+## the surface rises to the flood waterline (SHORE_H + 1 levels up); a second
+## cube is kept at the base level so no gap opens beneath the raised surface.
 func _draw_water_phase(phase: int, x: int, y: int, px: float, py: float, a := 1.0) -> void:
 	var n := _phase_sprite(phase, x, y)
 	match phase:
 		PHASE_HIGH:
-			_draw_sprite(n, px, py, a)   # fill below the raised surface
+			_draw_sprite(n, px, py, a)
 			_draw_sprite(n, px, py - float((SHORE_H + 1) * STEP), a)
 		PHASE_DRY:
 			_draw_sprite(n, px, py + DRY_DROP, a)

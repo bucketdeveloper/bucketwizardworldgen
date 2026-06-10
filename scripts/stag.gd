@@ -75,7 +75,6 @@ func _process(delta: float) -> void:
 				idle_left -= delta
 				if idle_left <= 0.0 and not _start_walk():
 					idle_left = randf_range(1.0, 3.0)  # boxed in; try again later
-	queue_redraw()
 
 
 ## The nearest boar's grid position if it is within FLEE_RADIUS, else INF.
@@ -155,11 +154,12 @@ func _start_flee(threat: Vector2) -> bool:
 	return true
 
 
-func _draw() -> void:
+## Sprite draw data for the terrain to composite this frame (see main._draw).
+func render() -> Dictionary:
 	var anim := "run" if state == RUN else ("walk" if state == WALK else "idle")
 	var tex: Texture2D = _tex.get(facing + "_" + anim)
 	if tex == null:
-		return
+		return {}
 	var n := int(tex.get_width() / FRAME_W)
 	var fh := float(tex.get_height())
 	var i := int(frame) % n
@@ -173,4 +173,10 @@ func _draw() -> void:
 	# Anchor at the centre of the surface diamond of the cell underfoot.
 	var ax := (p.x - p.y) * HALF_W + HALF_W
 	var ay := (p.x + p.y) * QUARTER_H - h * STEP + QUARTER_H
-	draw_texture_rect_region(tex, Rect2(ax - FRAME_W / 2.0, ay - fh + FOOT, FRAME_W, fh), src)
+	return {
+		d = p.x + p.y,
+		tex = tex,
+		src = src,
+		dst = Rect2(ax - FRAME_W / 2.0, ay - fh + FOOT, FRAME_W, fh),
+		mod = Color.WHITE,
+	}
