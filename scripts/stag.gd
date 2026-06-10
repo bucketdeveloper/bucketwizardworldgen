@@ -1,8 +1,12 @@
 extends Node2D
 ## A wandering stag critter. Walks idly around the map, but runs away from any
-## boar that gets too close. Uses the same four facings as the other critters
-## (NW/NE/SE/SW); animations are single-row STRIPS of 32x41 frames (idle 24,
-## walk 11, run 10 — frame count is derived from the texture width).
+## boar that gets too close. Caught in heavy rain or a thunderstorm, it runs to
+## stand under the nearest tree; with no tree nearby it runs until it is
+## RAIN_ESCAPE tiles clear of the rain, and if neither is possible it shrugs
+## and carries on as normal (retrying after SHELTER_RETRY seconds). A boar
+## threat always outranks the weather. Uses the same four facings as the other
+## critters (NW/NE/SE/SW); animations are single-row STRIPS of 32x41 frames
+## (idle 24, walk 11, run 10 — frame count is derived from the texture width).
 
 const HALF_W := 16            # iso horizontal half-step (matches main.gd)
 const QUARTER_H := 8          # iso vertical step
@@ -16,6 +20,9 @@ const WALK_SPEED := 1.5       # tiles per second
 const RUN_SPEED := 5.0        # tiles per second when fleeing
 const FLEE_RADIUS := 6.0      # boars closer than this (in tiles) cause a flee
 const FOOT := 4.0             # px between frame bottom and the stag's feet
+const SHELTER_TREE_RADIUS := 15.0  # trees farther than this don't count as "nearby"
+const RAIN_ESCAPE := 5.0      # with no tree, run until this many tiles clear of rain
+const SHELTER_RETRY := 4.0    # seconds to behave normally after failing to shelter
 
 # Grid step -> facing name (matches the asset file names).
 const DIR_NAME := {
@@ -37,6 +44,8 @@ var idle_left := 0.0          # seconds of idling remaining
 var walk_cells := 0           # cells left to walk
 var frame := 0.0
 var _tex := {}                # "SE_run" -> Texture2D
+var _fleeing_rain := false    # running away from rain (no tree available)
+var _shelter_block := 0.0     # seconds left ignoring rain after a failed shelter
 
 
 func setup(w: Node2D, c: Vector2i) -> void:
@@ -61,6 +70,7 @@ func grid_pos() -> Vector2:
 func _process(delta: float) -> void:
 	var fps := RUN_FPS if state == RUN else (WALK_FPS if state == WALK else IDLE_FPS)
 	frame += delta * fps
+	_shelter_block = maxf(0.0, _shelter_block - delta)
 	match state:
 		RUN:
 			_advance(delta * RUN_SPEED)
@@ -69,12 +79,59 @@ func _process(delta: float) -> void:
 		IDLE:
 			var threat := _threat()
 			if threat != Vector2.INF:
+				_fleeing_rain = false
 				if not _start_flee(threat):
 					idle_left = maxf(idle_left, 0.2)   # cornered; check again soon
+			elif _rained() and world.has_tree(cell):
+				idle_left = maxf(idle_left, 0.5)   # wait out the rain under the tree
+			elif _rained() and _shelter_block <= 0.0:
+				if not _start_shelter():
+					_shelter_block = SHELTER_RETRY  # can't shelter: carry on normally
 			else:
 				idle_left -= delta
 				if idle_left <= 0.0 and not _start_walk():
 					idle_left = randf_range(1.0, 3.0)  # boxed in; try again later
+
+
+## True when the stag is inside a heavy-rain / thunderstorm footprint.
+func _rained() -> bool:
+	return world.rain_distance(grid_pos()) <= world.rain_wet_radius + 0.5
+
+
+## Reacts to rain: run for the nearest nearby tree; with no tree in range, run
+## away until clear of the rain. False if neither is possible from here.
+func _start_shelter() -> bool:
+	var tree: Vector2 = world.nearest_tree(grid_pos())
+	if tree != Vector2.INF and grid_pos().distance_to(tree) <= SHELTER_TREE_RADIUS:
+		if _run_toward(Vector2i(roundi(tree.x), roundi(tree.y))):
+			return true
+	var rain: Vector2 = world.nearest_rain(grid_pos())
+	if rain != Vector2.INF and _start_flee(rain):
+		_fleeing_rain = true
+		return true
+	return false
+
+
+## Starts running one walkable step that gets strictly closer to goal.
+## False if every such step is blocked.
+func _run_toward(goal: Vector2i) -> bool:
+	var best := Vector2i.ZERO
+	var best_d := Vector2(cell).distance_to(Vector2(goal))
+	for d: Vector2i in DIR_NAME.keys():
+		if world.is_critter_walkable(cell, cell + d):
+			var dist := Vector2(cell + d).distance_to(Vector2(goal))
+			if dist < best_d:
+				best_d = dist
+				best = d
+	if best == Vector2i.ZERO:
+		return false
+	if state != RUN:
+		frame = 0.0
+		move_t = 0.0
+	state = RUN
+	move_dir = best
+	facing = DIR_NAME[best]
+	return true
 
 
 ## The nearest boar's grid position if it is within FLEE_RADIUS, else INF.
@@ -94,8 +151,30 @@ func _advance(dist: float) -> void:
 		cell += move_dir
 		var threat := _threat()
 		if threat != Vector2.INF:
+			_fleeing_rain = false
 			if not _start_flee(threat):
 				_start_idle()   # cornered: freeze
+			continue
+		# Outrunning rain with no tree: keep going until RAIN_ESCAPE tiles clear.
+		if _fleeing_rain:
+			var rain: Vector2 = world.nearest_rain(Vector2(cell))
+			if rain == Vector2.INF \
+					or Vector2(cell).distance_to(rain) >= world.rain_wet_radius + RAIN_ESCAPE:
+				_fleeing_rain = false
+				_start_idle()   # far enough; rain may also have stopped
+			elif not _start_flee(rain):
+				_fleeing_rain = false
+				_shelter_block = SHELTER_RETRY   # boxed in: give up gracefully
+				_start_idle()
+			continue
+		# Caught in the rain: steer for shelter (re-aimed every cell, so a moving
+		# storm or a vanished tree just changes the plan at the next arrival).
+		if _shelter_block <= 0.0 and _rained():
+			if world.has_tree(cell):
+				_start_idle()   # made it: stand under this tree
+			elif not _start_shelter():
+				_shelter_block = SHELTER_RETRY
+				_start_idle()
 			continue
 		if state == RUN:
 			_start_idle()       # escaped

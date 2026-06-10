@@ -58,6 +58,9 @@ enum { GRASS, DIRT, WATER }
 # Grass: the three clean diamond tiles are the default; the thicker/leafier
 # variants (row 2 col 7 .. row 3 col 3) appear in grown clumps, not at random.
 const GRASS_MAIN := [22, 23, 24]
+# The middle GRASS_MAIN tile (row 2, col 1): the "thicker" grass that the other
+# two plain grass tiles temporarily become when heavy rain falls on them.
+const GRASS_LUSH := 23
 const THICK_GRASS := [29, 30, 31, 32, 33, 34, 35, 36]
 # row 0 dry dirt cols 0-4  +  row 1 cracked dirt cols 0-2
 const DIRT_TILES := [0, 1, 2, 3, 4, 11, 12, 13]
@@ -86,6 +89,13 @@ const WATER_DARK_OFFSET := 11
 # the shoreline tile whose land-abutting sides face the wave's direction of
 # travel, lifted by this many pixels, so the front reads as a rushing wave lip.
 const RUSH_LIFT := TILE_PX / 6.0
+# Splash: when arriving high (power 2) water slaps against land it doesn't
+# cover, a one-shot splash animation plays on that tile. The sheet is a 1x8
+# strip played start-to-finish in SPLASH_SECONDS.
+const SPLASH_FRAMES := 8
+const SPLASH_SECONDS := 0.75
+const SPLASH_SCALE := 0.03    # source frames are 732x704; ~22px on screen
+const SPLASH_SQUASH := 0.5    # extra vertical-only squash (height = scale * this)
 # Row 1 (cracked dirt) is shown when a water cell is in the dry phase.
 const DRY_TILES := [11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21]
 # Water's top face sits ~4px lower than land's, so dry tiles are drawn this many
@@ -174,6 +184,9 @@ const FLOOD_DRY_MULT := 4.0
 # Rained-on dirt sprouts grass: the cell turns to a grass tile and reverts to
 # its old dirt tile this many seconds after rain last touched it.
 @export var rain_grass_seconds := 60.0
+# Rained-on plain grass (the two non-lush GRASS_MAIN tiles) thickens to the
+# GRASS_LUSH tile, reverting this many seconds after rain last touched it.
+@export var rain_lush_seconds := 60.0
 # Lakes grown out from the rivers they attach to.
 @export var lake_min_count := 1
 @export var lake_max_count := 3
@@ -194,6 +207,10 @@ var _hiwtile: Array = []        # _hiwtile[x][y] -> high-phase sprite for water 
 var _floodtile: Array = []      # _floodtile[x][y] -> flood sprite over shore cells in high phase, or -1
 var _rocktile: Array = []       # _rocktile[x][y]  -> row-7 rock sprite on a water cell, or -1
 var _rushtile: Array = []       # _rushtile[x][y]  -> leading-edge wave sprite (water cells)
+var _splash_sheet: Texture2D
+var _splash_by_dist: Dictionary = {}  # ring distance -> Array[Vector2i] of splash cells
+var _dist_high: Dictionary = {}       # ring distance -> bool (ring is in the HIGH phase)
+var _splashes: Dictionary = {}        # Vector2i -> start time of a live splash
 var _boars: Array = []          # live boar critter nodes
 var _stags: Array = []          # live stag critter nodes
 var _trees: Array = []          # live tree nodes
@@ -208,6 +225,7 @@ var _rain_until: Dictionary = {}  # Vector2i source cell -> rain-boost expiry ti
 var _boosted: Dictionary = {}   # Vector2i -> true, cells raised one water level this frame
 var _wetness: Dictionary = {}   # Vector2i land cell -> 0..1 accumulated puddle water
 var _grassed: Dictionary = {}   # Vector2i dirt cell rained into grass -> {until, old sprite}
+var _lushed: Dictionary = {}    # Vector2i grass cell rained lush -> {until, old sprite}
 var _storm := false             # UI storm toggle: all clouds held at thunderstorm
 # Wind, shared by all clouds (UI-controlled). The direction is the grid-space
 # drift of the clouds; the default +y means wind FROM the NE (top-right).
@@ -222,6 +240,7 @@ var _last_tick := -1            # last ring tick that triggered a redraw
 func _ready() -> void:
 	texture_filter = CanvasItem.TEXTURE_FILTER_NEAREST   # crisp pixel art
 	_sheet = load("res://assets/spritesheet.png")
+	_splash_sheet = load("res://assets/environment/splash_sprites.png")
 	randomize()
 	_generate()
 	_center_camera()
@@ -246,6 +265,7 @@ func _generate() -> void:
 	_mark_thick_clumps()
 	_build_water_distance()
 	_build_columns()
+	_build_splash_cells()
 	_spawn_critters()
 	queue_redraw()
 
@@ -270,6 +290,7 @@ func _spawn_critters() -> void:
 	_boosted = {}
 	_wetness = {}
 	_grassed = {}
+	_lushed = {}
 	_boars = _spawn_herd(BoarScript, randi_range(boar_min_count, boar_max_count))
 	_stags = _spawn_herd(StagScript, randi_range(stag_min_count, stag_max_count))
 	_spawn_trees()
@@ -523,6 +544,47 @@ func nearest_boar(p: Vector2) -> Vector2:
 	return best
 
 
+## Distance in cells from grid position p to the nearest raining (heavy or
+## thunder) cloud's ground contact point; INF when nothing is raining.
+func rain_distance(p: Vector2) -> float:
+	var best := INF
+	for cloud in _clouds:
+		if cloud.is_heavy_rain():
+			best = minf(best, p.distance_to(Vector2(cloud.rain_cell())))
+	return best
+
+
+## Ground contact point of the nearest raining cloud, or Vector2.INF if none.
+func nearest_rain(p: Vector2) -> Vector2:
+	var best := Vector2.INF
+	var best_d := INF
+	for cloud in _clouds:
+		if cloud.is_heavy_rain():
+			var q := Vector2(cloud.rain_cell())
+			var d := p.distance_squared_to(q)
+			if d < best_d:
+				best_d = d
+				best = q
+	return best
+
+
+## True if a living tree stands on cell c.
+func has_tree(c: Vector2i) -> bool:
+	return _tree_at.has(c)
+
+
+## Grid position of the nearest living tree to p, or Vector2.INF if none.
+func nearest_tree(p: Vector2) -> Vector2:
+	var best := Vector2.INF
+	var best_d := INF
+	for c: Vector2i in _tree_at:
+		var d := p.distance_squared_to(Vector2(c))
+		if d < best_d:
+			best_d = d
+			best = Vector2(c)
+	return best
+
+
 func _process(delta: float) -> void:
 	_time += delta
 	_reap_trees()
@@ -533,12 +595,14 @@ func _process(delta: float) -> void:
 		_add_cloud_bank()
 		_next_cloud = randf_range(cloud_spawn_min, cloud_spawn_max)
 	_update_fish()
+	_update_splashes()
 	_update_rain_boost(delta)
 	# Entities animate and move continuously, and they're composited into _draw,
 	# so the scene must redraw every frame whenever any are present.
 	if not _boars.is_empty() or not _stags.is_empty() or not _trees.is_empty() \
 			or not _clouds.is_empty() or not _fish_at.is_empty() or not _rain_until.is_empty() \
-			or not _birds.is_empty() or not _wetness.is_empty() or not _grassed.is_empty():
+			or not _birds.is_empty() or not _wetness.is_empty() or not _grassed.is_empty() \
+			or not _lushed.is_empty() or not _splashes.is_empty():
 		queue_redraw()
 		return
 	# Otherwise redraw every frame while any tile may be cross-fading, else only
@@ -583,6 +647,52 @@ func _reap_clouds() -> void:
 			alive.append(c)
 	if alive.size() != _clouds.size():
 		_clouds = alive
+
+
+## Cells where arriving high water meets land it doesn't cover: water tiles and
+## flood-able shoulder tiles whose flood-waterline sprite has a land-facing
+## edge (i.e. isn't open water at the flood level), grouped by ring distance so
+## the wave watcher can trigger a whole ring's splashes at once.
+func _build_splash_cells() -> void:
+	_splash_by_dist = {}
+	_dist_high = {}
+	_splashes = {}
+	for x in MAP_W:
+		for y in MAP_H:
+			var d: int = _wdist[x][y]
+			if d < 0:
+				continue
+			var edge := -1
+			if _terrain[x][y] == WATER:
+				edge = _hiwtile[x][y]
+			elif _height[x][y] == SHORE_H:
+				edge = _floodtile[x][y]
+			if edge >= 0 and edge != WATER_OPEN:
+				if not _splash_by_dist.has(d):
+					_splash_by_dist[d] = []
+				_splash_by_dist[d].append(Vector2i(x, y))
+
+
+## Water-power phase of ring distance d at the current time (no fade info).
+func _dist_phase(d: int) -> int:
+	var since := _time - d * water_ring_seconds
+	if since < 0.0:
+		return PHASE_LOW
+	return floori(since / water_cycle_seconds) % 3
+
+
+## The moment a ring enters the HIGH phase, every splash cell at that distance
+## starts a one-shot splash; finished splashes are dropped.
+func _update_splashes() -> void:
+	for d in _splash_by_dist:
+		var high := _dist_phase(d) == PHASE_HIGH
+		if high and not _dist_high.get(d, false):
+			for c: Vector2i in _splash_by_dist[d]:
+				_splashes[c] = _time
+		_dist_high[d] = high
+	for c: Vector2i in _splashes.keys():
+		if _time - _splashes[c] >= SPLASH_SECONDS:
+			_splashes.erase(c)
 
 
 ## True once cell-distance d's water has fully faded into the dry phase (the
@@ -1231,6 +1341,11 @@ func _draw() -> void:
 				# so the water covers the tree base; skip it here in that case.
 				if not _tree_at.has(Vector2i(x, y)):
 					_draw_cell_flood(x, y, base_x, base_y)
+			# One-shot splash where arriving high water slaps against land it
+			# doesn't cover, anchored on the flood waterline.
+			var sp: float = _splashes.get(Vector2i(x, y), -1.0)
+			if sp >= 0.0:
+				_draw_splash(_time - sp, base_x, base_y - float((SHORE_H + 1) * STEP))
 		# Draw entities standing on this diagonal (or just behind it). Tiles on
 		# later diagonals are drawn afterwards and so correctly occlude them.
 		while ei < ents.size() and ents[ei].d < s + 1.0:
@@ -1360,6 +1475,18 @@ func _update_rain_boost(delta: float) -> void:
 						_grassed[c] = {until = _time + rain_grass_seconds, old = ids[top]}
 						_columns[c.x][c.y][top] = GRASS_MAIN[randi() % GRASS_MAIN.size()]
 						_terrain[c.x][c.y] = GRASS
+					# Rained-on plain grass thickens to the lush tile. Cells that
+					# are temporary grass themselves (_grassed) are skipped so the
+					# two reverts can't fight over the original sprite.
+					if _lushed.has(c):
+						_lushed[c].until = _time + rain_lush_seconds
+					elif not _grassed.has(c) and _terrain[c.x][c.y] == GRASS \
+							and not _stone[c.x][c.y]:
+						var gids: PackedInt32Array = _columns[c.x][c.y]
+						var gtop := gids.size() - 1
+						if gids[gtop] != GRASS_LUSH and GRASS_MAIN.has(gids[gtop]):
+							_lushed[c] = {until = _time + rain_lush_seconds, old = gids[gtop]}
+							_columns[c.x][c.y][gtop] = GRASS_LUSH
 	# Cells no longer under rain dry back out and are dropped at zero.
 	for c: Vector2i in _wetness.keys():
 		if rained.has(c):
@@ -1375,6 +1502,11 @@ func _update_rain_boost(delta: float) -> void:
 			_columns[c.x][c.y][_columns[c.x][c.y].size() - 1] = _grassed[c].old
 			_terrain[c.x][c.y] = DIRT
 			_grassed.erase(c)
+	# Thickened grass reverts to its original plain tile the same way.
+	for c: Vector2i in _lushed.keys():
+		if _lushed[c].until <= _time:
+			_columns[c.x][c.y][_columns[c.x][c.y].size() - 1] = _lushed[c].old
+			_lushed.erase(c)
 	for c: Vector2i in _rain_until.keys():
 		if _rain_until[c] <= _time:
 			_rain_until.erase(c)
@@ -1432,6 +1564,25 @@ func _draw_flood(n: int, px: float, py: float, a: float) -> void:
 	_draw_sprite(n, px, py, a)
 	if flood_density > 0.0:
 		_draw_sprite(n, px, py, a * flood_density)
+
+
+## Draws one frame of the splash animation, bottom-centred on the tile whose
+## (raised, flood-level) cube top-left is at (px, py). The whole 8-frame strip
+## plays once over SPLASH_SECONDS.
+func _draw_splash(elapsed: float, px: float, py: float) -> void:
+	var i := int(elapsed / SPLASH_SECONDS * SPLASH_FRAMES)
+	if i < 0 or i >= SPLASH_FRAMES or _splash_sheet == null:
+		return
+	var fw := _splash_sheet.get_width() / float(SPLASH_FRAMES)
+	var fh := float(_splash_sheet.get_height())
+	var w := fw * SPLASH_SCALE
+	var h := fh * SPLASH_SCALE * SPLASH_SQUASH
+	# Feet on the water surface: the face centre sits ~QUARTER_H + DRY_DROP
+	# below the cube's top-left corner.
+	var foot := py + QUARTER_H + DRY_DROP
+	draw_texture_rect_region(_splash_sheet,
+		Rect2(px + (TILE_PX - w) * 0.5, foot - h, w, h),
+		Rect2(i * fw, 0.0, fw, fh))
 
 
 func _draw_sprite(n: int, px: float, py: float, alpha := 1.0) -> void:

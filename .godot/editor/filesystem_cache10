@@ -73,20 +73,22 @@ wolf-death.png::CompressedTexture2D::6793874264045870781::1780627449::1780627455
 wolf-howl.png::CompressedTexture2D::879491739003574200::1780627449::1780627455::1::::<><><>0<>0<>e0ad0f5f258ac753cacbbdd1790ed0d1<>res://.godot/imported/wolf-howl.png-529902dd78c17e9a6468dc8d5af63318.ctex::
 wolf-idle.png::CompressedTexture2D::8366678346100050751::1780627449::1780627455::1::::<><><>0<>0<>60561cc828560a39d60bd752deb11c49<>res://.godot/imported/wolf-idle.png-8b995173a316c0c67879f32a4ecc2a8a.ctex::
 wolf-run.png::CompressedTexture2D::6138638083906234560::1780627449::1780627455::1::::<><><>0<>0<>222b8a00e51b504bfa73d8d8643659f2<>res://.godot/imported/wolf-run.png-a166424b4a79180e896dbaacd355934e.ctex::
-::res://assets/environment/::1781063288
+::res://assets/environment/::1781103485
 cloud sprites.png::CompressedTexture2D::5262307714481393029::1781060170::1781063335::1::::<><><>0<>0<>2ad4018919985091a588fc84ba0bf13f<>res://.godot/imported/cloud sprites.png-91ea438b9c5973a0b040d581c272a323.ctex::
 flame_sprites.png::CompressedTexture2D::6626734883386647183::1781056508::1781056510::1::::<><><>0<>0<>3c43087d3d9569ab76e55a054b48b328<>res://.godot/imported/flame_sprites.png-96c8727426db9624b705f4458e7d310a.ctex::
+splash_sprites.png::CompressedTexture2D::8558316945877149403::1781103500::1781103601::1::::<><><>0<>0<>88decc8c00abc00e139099b8025fe6d8<>res://.godot/imported/splash_sprites.png-3b2cb63ce5b68aa96d08ade498a45cff.ctex::
 ::res://assets/trees/::1780700704
 tree_sprites.png::CompressedTexture2D::6927278568240550059::1780700703::1780700704::1::::<><><>0<>0<>a2592042e4c02461807496973bd88877<>res://.godot/imported/tree_sprites.png-b9a4429dcdb6c3bdcef8f8be4ded7667.ctex::
 ::res://scenes/::1780367414
 main.tscn::PackedScene::6086457619088793805::1780367414::0::1::::<><><>0<>0<><>::uid://bp1rsbw15ii7k::::res://scripts/main.gd<>uid://cq2s0nxq8eklr::::res://scripts/camera_controller.gd
-::res://scripts/::1781063123
+::res://scripts/::1781102787
 bird.gd::GDScript::4876512674910153758::1781062056::0::1::::<>Node2D<><>0<>0<><>::
 boar.gd::GDScript::3799510927490805007::1780701518::0::1::::<>Node2D<><>0<>0<><>::
 camera_controller.gd::GDScript::5952739334777041439::1780365344::0::1::::<>Camera2D<><>0<>0<><>::
-cloud.gd::GDScript::6861717734402012152::1781063123::0::1::::<>Node2D<><>0<>0<><>::
+cloud.gd::GDScript::6861717734402012152::1781102098::0::1::::<>Node2D<><>0<>0<><>::
 fish.gd::GDScript::6605862614283005975::1781062412::0::1::::<>Node2D<><>0<>0<><>::
-main.gd::GDScript::3493991580767242186::1781063115::0::1::::<>Node2D<><>0<>0<><>::
+main.gd::GDScript::3493991580767242186::1781102787::0::1::::<>Node2D<><>0<>0<><>::
 stag.gd::GDScript::7365218826905673654::1780701534::0::1::::<>Node2D<><>0<>0<><>::
-tree.gd::GDScript::3007678803161887182::1781062277::0::1::::<>Node2D<><>0<>0<><>::
+tree.gd::GDScript::3007678803161887182::1781100464::0::1::::<>Node2D<><>0<>0<><>::
+ui_panel.gd::GDScript::1762584304000098532::1781102212::0::1::::<>CanvasLayer<><>0<>0<><>::
 ::res://tools/::1780366517
