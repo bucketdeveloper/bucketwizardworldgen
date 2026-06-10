@@ -3,3 +3,4 @@ res://scripts/cloud.gd
 res://scripts/tree.gd
 res://scripts/bird.gd
 res://scripts/fish.gd
+res://scripts/ui_panel.gd

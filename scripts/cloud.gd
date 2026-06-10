@@ -13,10 +13,11 @@ extends Node2D
 ##   heavy   - sprites 4,5,8,9,10 animated; moves at 25% wind speed.
 ##   thunder - the last row (11..15) looped in THUNDER_SECONDS; full speed.
 ##
-## Wind blows from the top-right of the map to the bottom-left, which on the iso
-## grid is the +y direction, so the cloud just increases its grid y over time.
-## main spawns clouds off the top-right edge and removes them once they drift
-## past the bottom-left edge (see main._reap_clouds).
+## Wind direction and speed are owned by main (see main.wind_vector and the UI
+## wind controls); by default it blows from the top-right (NE) toward the
+## bottom-left, the +y direction on the iso grid. main spawns clouds off the
+## upwind edge and removes them once they drift past the downwind edge (see
+## main._reap_clouds).
 
 const HALF_W := 16            # iso horizontal half-step (matches main.gd)
 const QUARTER_H := 8          # iso vertical step
@@ -55,11 +56,10 @@ const CYCLE := [
 const PHASE_MIN := 10.0       # each cycle phase lasts this..PHASE_MAX seconds
 const PHASE_MAX := 20.0
 
-const WIND_SPEED := 0.75      # base drift, cells/sec along +y (top-right -> bottom-left)
 const RAIN_FPS := 8.0         # light/heavy rain frame animation rate
 const THUNDER_SECONDS := 0.5  # time for one full loop of the last row
-const BREATHE_MIN := 3.0      # dry "breathing" period range (seconds)
-const BREATHE_MAX := 6.0
+const BREATHE_MIN := 9.0      # dry "breathing" period range (seconds)
+const BREATHE_MAX := 18.0
 const BREATHE_AMP := 0.15     # dry cloud grows up to +15% and back
 
 const CLOUD_SCALE := 0.6      # base draw scale of the sprite art
@@ -67,7 +67,8 @@ const CLOUD_LIFT := 60.0      # pixels the cloud floats above the ground plane
 
 static var _sheet: Texture2D
 
-var pos := Vector2.ZERO       # continuous grid position (drifts in +y)
+var world: Node2D             # the terrain node (scripts/main.gd), owns the wind
+var pos := Vector2.ZERO       # continuous grid position (drifts with the wind)
 var _cycle_i := 0             # index into CYCLE
 var _phase_left := 0.0        # seconds left in the current phase
 var _anim_t := 0.0            # animation timer within the current phase
@@ -75,9 +76,10 @@ var _breathe_t := 0.0         # breathing timer (dry phase)
 var _breathe_period := 4.0
 
 
-func setup(start: Vector2) -> void:
+func setup(w: Node2D, start: Vector2) -> void:
 	if _sheet == null:
 		_sheet = load("res://assets/environment/cloud sprites.png")
+	world = w
 	pos = start
 	_cycle_i = 0
 	_phase_left = randf_range(PHASE_MIN, PHASE_MAX)
@@ -90,9 +92,42 @@ func _phase() -> int:
 	return CYCLE[_cycle_i]
 
 
-## True while this cloud is dropping heavy rain (used to wet tiles below it).
+## Forces the cloud into its thunderstorm phase and holds it there (the
+## infinite phase timer never expires) until restart_cycle() is called.
+## Used by the UI storm toggle.
+func force_thunder() -> void:
+	_cycle_i = CYCLE.find(Phase.THUNDER)
+	_phase_left = INF
+	_anim_t = 0.0
+
+
+## Restarts the normal weather cycle from its start (a fresh dry phase).
+func restart_cycle() -> void:
+	_cycle_i = 0
+	_phase_left = randf_range(PHASE_MIN, PHASE_MAX)
+	_anim_t = 0.0
+	_breathe_period = randf_range(BREATHE_MIN, BREATHE_MAX)
+	_breathe_t = randf() * _breathe_period
+
+
+## True while this cloud is dropping heavy rain — the heavy and thunderstorm
+## phases both count (used to wet tiles below it).
 func is_heavy_rain() -> bool:
-	return _phase() == Phase.HEAVY
+	return _phase() == Phase.HEAVY or _phase() == Phase.THUNDER
+
+
+## Grid cell where the rain column visually meets the ground. The cloud body is
+## drawn CLOUD_LIFT px above the ground plane, top-anchored, with the rain
+## streaks hanging below it, so the contact point sits down-left (+x, +y) of
+## pos. Derived from the current frame's drawn height so it tracks the art.
+func rain_cell() -> Vector2i:
+	var rc: Rect2 = FRAMES[_frame_index()]
+	# Screen y of the bottom edge of the sprite (where the rain ends).
+	var bottom := (pos.x + pos.y) * QUARTER_H + QUARTER_H - CLOUD_LIFT \
+		+ rc.size.y * CLOUD_SCALE
+	var s := bottom / QUARTER_H   # grid diagonal (gx + gy) at that screen y
+	var d := pos.x - pos.y        # same screen column as the cloud centre
+	return Vector2i(roundi((s + d) * 0.5), roundi((s - d) * 0.5))
 
 
 ## Wind-speed multiplier for the current weather (rain slows the cloud down).
@@ -115,7 +150,7 @@ func _process(delta: float) -> void:
 		if _phase() == Phase.DRY:
 			_breathe_period = randf_range(BREATHE_MIN, BREATHE_MAX)
 			_breathe_t = 0.0
-	pos.y += WIND_SPEED * _speed_mult() * delta
+	pos += world.wind_vector() * _speed_mult() * delta
 	_anim_t += delta
 	_breathe_t += delta
 

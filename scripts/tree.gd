@@ -8,12 +8,9 @@ extends Node2D
 ## Life cycle (the first row of the sheet is unused):
 ##   GROW  - frames GROW_START..GROW_END on the second row, one per
 ##           SECONDS_PER_FRAME, then it stops growing.
-##   HOLD  - sits on GROW_END for a random HOLD_MIN..HOLD_MAX seconds (each tree
-##           rolls its own), so a forest doesn't fall in unison.
-##   FALL  - the last two rows (FALL_START..FINAL_FRAME) play as one quick fall,
-##           the whole sequence taking FALL_SECONDS.
-##   FINAL - the last debris frame shows for FINAL_HOLD_SECONDS, then the tree
-##           marks itself `finished` and main removes it.
+##   HOLD  - sits fully grown on GROW_END indefinitely; trees no longer fall.
+## (FALL and FINAL — the falling rows and debris frame — are retained below but
+## unreachable, in case falling is ever brought back.)
 ##
 ## Because rows differ and trees aren't centred in their cell, FRAME_BASE holds
 ## each frame's baseline (bottom opaque row, from the cell top) and FRAME_CX its
@@ -127,11 +124,10 @@ func _process(delta: float) -> void:
 					_phase = Phase.HOLD
 					_elapsed = 0.0
 		Phase.HOLD:
-			# Sit fully grown for this tree's random spell, then start to fall.
-			if _elapsed >= _hold_for:
-				_phase = Phase.FALL
-				_elapsed = 0.0
-				frame = FALL_START
+			# Fully grown trees stay standing indefinitely. (The FALL/FINAL
+			# phases and their frames are kept below should falling ever come
+			# back, but nothing transitions into them any more.)
+			pass
 		Phase.FALL:
 			# Play the two falling rows quickly; the whole fall takes FALL_SECONDS.
 			if _elapsed >= FALL_SECONDS_PER_FRAME:
